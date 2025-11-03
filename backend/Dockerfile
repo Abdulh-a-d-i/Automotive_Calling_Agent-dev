@@ -8,7 +8,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies for PostgreSQL and building packages
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     libpq-dev gcc \
     && rm -rf /var/lib/apt/lists/*
@@ -20,8 +20,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Expose FastAPI default port
-EXPOSE 8000
+# --- NO EXPOSE needed ---
 
-# Run FastAPI app
-CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# --- Uvicorn CMD using Shell Form ---
+# Note: No square brackets, let the shell handle $PORT
+# Adjust 'main:app' if needed (e.g., 'src.main:app')
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT

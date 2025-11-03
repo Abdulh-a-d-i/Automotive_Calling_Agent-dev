@@ -21,3 +21,4 @@ livekit-plugins-silero
 livekit.plugins.turn_detector
 pytz
 google-cloud-storage
+psycopg2

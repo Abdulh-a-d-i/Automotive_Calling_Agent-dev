@@ -6,7 +6,7 @@ import logging
 # Use environment variable for security, fallback to a default for dev
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your_dev_secret_key")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
+ACCESS_TOKEN_EXPIRE_MINUTES = 500  
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()

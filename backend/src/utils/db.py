@@ -3,38 +3,405 @@ from datetime import datetime
 import bcrypt
 import urllib.parse
 import json
-import psycopg2
+import psycopg2  # ✅ Keep this
+from psycopg2 import pool 
 import logging
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import traceback
 
+import json
+from datetime import datetime
+
 load_dotenv()
 
 class PGDB:
+    _instance = None
+    _pool = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
     def __init__(self):
-        # host = os.getenv('HOST')
-        # port = os.getenv('DB_PORT')
-        # user = os.getenv('USER')
-        # password = os.getenv('PASSWORD')
-        # db_name = os.getenv('DATABASE_NAME')
-
-        # if not all([host, port, user, password, db_name]):
-        #     raise ValueError("Missing required database environment variables")
-
-        # password_encoded = urllib.parse.quote_plus(password)
-        # self.connection_string = f"postgresql://{user}:{password_encoded}@{host}:{port}/{db_name}"
+        if PGDB._pool is not None:
+            return  # Already initialized
+            
         self.connection_string = os.getenv('DATABASE_URL')
-
+        
+        # ✅ Create pool ONCE
+        PGDB._pool = pool.SimpleConnectionPool(
+            5, 50, self.connection_string
+        )
+        
+        # ✅ Create tables ONCE
         self.create_users_table()
         self.create_call_history_table()
         self.create_appointments_table()
+        self.update_call_history_for_recordings() 
+        self.create_user_prompts_table()
+
     def get_connection(self):
+        """Get connection from pool"""
+        return PGDB._pool.getconn()
+    
+    def release_connection(self, conn):
+        """Return connection to pool"""
+        PGDB._pool.putconn(conn)
+
+    def create_user_prompts_table(self):
+        """
+        Create table to store per-user system prompt customizations.
+        Each user has ONE active prompt stored as plain text.
+        """
+        conn = self.get_connection()
         try:
-            return psycopg2.connect(self.connection_string)
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_prompts (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                        system_prompt TEXT DEFAULT 'You are SUMA, a helpful AI assistant. Be professional and courteous in all interactions.',
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_user_prompts_user_id 
+                    ON user_prompts(user_id);
+                """)
+            conn.commit()
+            logging.info("✅ user_prompts table created")
         except Exception as e:
-            logging.error(f"Database connection error: {e}")
+            logging.error(f"Error creating user_prompts table: {e}")
+        finally:
+            conn.close()
+
+
+    def create_default_user_prompt(self, user_id: int):
+        """
+        Create default prompt for a new user.
+        Called automatically on user registration.
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                default_prompt = """You are SUMA, you makes phone calls to businesses on behalf of clients to book appointments and reservations.
+
+                ### IDENTITY & ROLE
+
+                #### WHO YOU ARE:
+                - You represent your client
+                - You are the CUSTOMER calling the business
+                - You are NOT affiliated with the business you're calling
+
+                #### WHO YOU'RE CALLING:
+                - A business employee (receptionist, host, scheduler)
+                - Someone who has authority to book appointments
+                - They work AT the business you're calling
+
+                #### YOUR MISSION:
+                {call_context}
+
+                ### CONVERSATION PROTOCOL - MANDATORY SEQUENCE
+
+                #### STEP 1: INTRODUCTION [REQUIRED - ALWAYS START HERE]
+                **Template:** "Hi! This is {self.agent_name} calling on behalf of {self.caller_name}. How are you doing today?"
+
+                **Rules:**
+                - Use this exact greeting structure
+                - Always mention you're calling on behalf of your client
+                - Brief pleasantry to establish rapport
+                - Wait for their response
+
+                #### STEP 2: STATE PURPOSE [REQUIRED]
+                **Template:** "I'm calling to [book an appointment/make a reservation] for {self.caller_name}."
+
+                Then provide specifics:
+                - What service/appointment type is needed
+                - Any preferences (time of day, specific provider, etc.)
+                - Duration if relevant
+
+                **Rules:**
+                - Be clear and direct about why you're calling
+                - Don't assume they know why you're calling
+                - Provide enough detail for them to help you
+
+                #### STEP 3: LISTEN & GATHER OPTIONS [REQUIRED]
+                **Actions:**
+                - Let them propose available dates/times
+                - Ask clarifying questions if needed
+                - Take note of their suggestions"""
+
+                
+                cursor.execute("""
+                    INSERT INTO user_prompts (user_id, system_prompt)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO NOTHING;
+                """, (user_id, default_prompt))
+            conn.commit()
+            logging.info(f"✅ Created default prompt for user {user_id}")
+        except Exception as e:
+            logging.error(f"Error creating default prompt: {e}")
+        finally:
+            conn.close()
+
+
+    def get_user_prompt(self, user_id: int) -> dict:
+        """
+        Get the user's current system prompt.
+        Returns None if not found (creates default if missing).
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT 
+                        id,
+                        user_id,
+                        system_prompt,
+                        created_at,
+                        updated_at
+                    FROM user_prompts
+                    WHERE user_id = %s;
+                """, (user_id,))
+                result = cursor.fetchone()
+                
+                # If no prompt exists, create default
+                if not result:
+                    self.create_default_user_prompt(user_id)
+                    cursor.execute("""
+                        SELECT 
+                            id,
+                            user_id,
+                            system_prompt,
+                            created_at,
+                            updated_at
+                        FROM user_prompts
+                        WHERE user_id = %s;
+                    """, (user_id,))
+                    result = cursor.fetchone()
+                
+                return result
+        finally:
+            conn.close()
+
+
+    def update_user_system_prompt(self, user_id: int, system_prompt: str):
+        """
+        Update user's system prompt.
+        Stores exactly what is provided - no parsing.
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    UPDATE user_prompts
+                    SET system_prompt = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s
+                    RETURNING 
+                        id,
+                        user_id,
+                        system_prompt,
+                        created_at,
+                        updated_at;
+                """, (system_prompt, user_id))
+                result = cursor.fetchone()
+            
+            conn.commit()
+            logging.info(f"✅ Updated prompt for user {user_id}")
+            return result
+            
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error updating user prompt: {e}")
             raise
+        finally:
+            conn.close()
+
+
+    def reset_user_prompt_to_default(self, user_id: int):
+        """
+        Reset user's prompt to default text.
+        """
+        default_prompt = """You are SUMA, a professional AI assistant for business services.
+
+    Your responsibilities:
+    - Help schedule appointments and meetings
+    - Answer questions about services
+    - Be respectful, patient, and adapt to the business's communication style
+    - Always confirm important details before proceeding
+
+    Tone: Professional and friendly"""
+        
+        return self.update_user_system_prompt(user_id, default_prompt)
+
+
+    def get_user_customization_dict(self, user_id: int) -> dict:
+        """
+        Get user's system prompt for use in call initiation.
+        
+        Returns:
+            dict with key: system_prompt (full text)
+        """
+        prompt_data = self.get_user_prompt(user_id)
+        
+        if not prompt_data:
+            # Return default if not found
+            return {
+                "system_prompt": """You are SUMA, a professional AI assistant for business services.
+
+    Your responsibilities:
+    - Help schedule appointments and meetings
+    - Answer questions about services
+    - Be respectful, patient, and adapt to the business's communication style
+    - Always confirm important details before proceeding
+
+    Tone: Professional and friendly"""
+            }
+        
+        return {
+            "system_prompt": prompt_data['system_prompt']
+        }
+
+    def update_call_history_for_recordings(self):
+        """
+        Add recording_blob_data column to store actual recording bytes
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Check if column exists
+                cursor.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name='call_history' 
+                    AND column_name='recording_blob_data';
+                """)
+                
+                if not cursor.fetchone():
+                    cursor.execute("""
+                        ALTER TABLE call_history 
+                        ADD COLUMN recording_blob_data BYTEA NULL,
+                        ADD COLUMN recording_size INTEGER NULL,
+                        ADD COLUMN recording_content_type VARCHAR(100) DEFAULT 'audio/ogg';
+                    """)
+                    logging.info("✅ Added recording_blob_data column")
+                else:
+                    logging.info("ℹ️ recording_blob_data column already exists")
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Error updating call_history for recordings: {e}")
+        finally:
+            conn.close()
+
+   
+
+    def store_recording_blob(self, call_id: str, recording_data: bytes, content_type: str = "audio/ogg"):
+        """Store actual recording bytes"""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE call_history
+                    SET recording_blob_data = %s,
+                        recording_size = %s,
+                        recording_content_type = %s
+                    WHERE call_id = %s;
+                """, (psycopg2.Binary(recording_data), len(recording_data), content_type, call_id))
+            conn.commit()
+            logging.info(f"✅ Stored {len(recording_data)} bytes for {call_id}")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error storing recording: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅
+
+    # ==================== GET RECORDING FROM DB ====================
+    def get_recording_blob(self, call_id: str, user_id: int = None):
+        """
+        Retrieve recording bytes from database.
+        Returns: (bytes, content_type, size) or (None, None, None)
+        
+        Args:
+            call_id: Call identifier
+            user_id: User ID (optional, skip check if None for verification)
+        """
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                if user_id is not None:
+                    # Normal query with user_id check
+                    cursor.execute("""
+                        SELECT recording_blob_data, recording_content_type, recording_size
+                        FROM call_history
+                        WHERE call_id = %s AND user_id = %s;
+                    """, (call_id, user_id))
+                else:
+                    # Verification query without user_id check
+                    cursor.execute("""
+                        SELECT recording_blob_data, recording_content_type, recording_size
+                        FROM call_history
+                        WHERE call_id = %s;
+                    """, (call_id,))
+                
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return row[0], row[1], row[2]  # (bytes, content_type, size)
+                return None, None, None
+        except Exception as e:
+            logging.error(f"❌ Error retrieving recording blob: {e}")
+            return None, None, None
+        finally:
+            self.release_connection(conn)  
+
+    # ==================== MODIFIED: REGISTER USER (AUTO-CREATE PROMPT) ====================
+    def register_user(self, user_data):
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Check if email already exists
+                cursor.execute("SELECT id FROM users WHERE email = %s", (user_data['email'],))
+                if cursor.fetchone():
+                    raise ValueError("Email already registered.")
+
+                # Hash the password
+                hashed_password = bcrypt.hashpw(user_data['password'].encode('utf-8'), bcrypt.gensalt())
+
+                # Insert user
+                cursor.execute("""
+                    INSERT INTO users (username, email, password_hash, is_admin)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, username, email, created_at, is_admin;
+                """, (
+                    user_data['username'],
+                    user_data['email'],
+                    hashed_password.decode('utf-8'),
+                    user_data.get('is_admin', False)
+                ))
+
+                row = cursor.fetchone()
+                user_id = row["id"]
+                conn.commit()
+
+                # ✅ AUTO-CREATE DEFAULT PROMPT FOR NEW USER
+                self.create_user_prompt_on_register(user_id)
+
+                return {
+                    "id": row["id"],
+                    "username": row["username"],
+                    "email": row["email"],
+                    "created_at": row["created_at"]
+                }
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error in register_user: {e}")
+            raise
+        finally:
+            self.release_connection(conn)
 
     def create_users_table(self):
         conn = self.get_connection()
@@ -57,7 +424,7 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error creating users table: {e}")
         finally:
-            conn.close()
+            self.release_connection(conn)
 
     
     def create_call_history_table(self):
@@ -84,16 +451,21 @@ class PGDB:
                         voice_name TEXT,
                         from_number TEXT NULL,
                         to_number TEXT NULL,
-                        transcript_url TEXT,     -- ADDED
-                        transcript_blob TEXT,    -- ADDED
-                        recording_blob TEXT      -- ADDED
+                        transcript_url TEXT,        -- ADDED
+                        transcript_blob TEXT,       -- ADDED
+                        recording_blob TEXT,        -- ADDED
+                        events_log JSONB DEFAULT '[]',    -- ADDED: For webhooks
+                        agent_events JSONB DEFAULT '[]'   -- ADDED: For agent reports
                     );
                 """)
+                # Add indexes if missing (idempotent)
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_events_log ON call_history USING GIN (events_log);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_agent_events ON call_history USING GIN (agent_events);")
             conn.commit()
         except Exception as e:
             logging.error(f"Error creating call_history table: {e}")
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     # ============================= USERS LOGIC START =============================
@@ -113,20 +485,24 @@ class PGDB:
 
                 # Insert user
                 cursor.execute("""
-                    INSERT INTO users (username, email, password_hash,is_admin)
-                    VALUES (%s, %s, %s,%s)
-                    RETURNING id, username, email, created_at,is_admin;
+                    INSERT INTO users (username, email, password_hash, is_admin)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, username, email, created_at, is_admin;
                 """, (
                     user_data['username'],
                     user_data['email'],
                     hashed_password.decode('utf-8'),
-                    user_data['is_admin']
+                    user_data.get('is_admin', False)
                 ))
 
                 row = cursor.fetchone()
+                user_id = row["id"]
                 conn.commit()
 
-                # Match output with UserOut model
+                # ✅ AUTO-CREATE DEFAULT PROMPT FOR NEW USER
+                self.create_default_user_prompt(user_id)
+                logging.info(f"✅ Created default prompt for new user {user_id}")
+
                 return {
                     "id": row["id"],
                     "username": row["username"],
@@ -139,7 +515,8 @@ class PGDB:
             logging.error(f"Error in register_user: {e}")
             raise
         finally:
-            conn.close()
+            self.release_connection(conn)
+
 
     def login_user(self, user_data):
         """Verify user credentials by username or email and return user info."""
@@ -171,7 +548,7 @@ class PGDB:
             logging.error(f"Error during login: {str(e)}")
             raise
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def get_user_by_id(self, user_id: int):
@@ -186,7 +563,7 @@ class PGDB:
                 return cursor.fetchone()
         finally:
             if conn:
-                conn.close()
+                self.release_connection(conn)
 
     def delete_user_by_id(self,user_id):
         """
@@ -211,7 +588,7 @@ class PGDB:
                 return False
         finally:
             if conn:
-                conn.close()
+                self.release_connection(conn)
 
     def update_user_name_fields(self, user_id: int, first_name: str, last_name: str):
         conn = self.get_connection()
@@ -230,7 +607,7 @@ class PGDB:
             logging.error(f"Error updating name fields: {e}")
             return False
         finally:
-            conn.close()
+            self.release_connection(conn)
 
     def change_user_password(self, user_id: int, current_password: str, new_password: str):
         conn = self.get_connection()
@@ -261,7 +638,7 @@ class PGDB:
             logging.error(f"Password change error: {e}")
             raise
         finally:
-            conn.close()             
+            self.release_connection(conn)
 
     def get_all_users(self):
         query = """
@@ -288,7 +665,7 @@ class PGDB:
                     for row in result
                 ]
         finally:
-            conn.close()
+            self.release_connection(conn)
 
     def get_all_users_paginated(self, page: int = 1, page_size: int = 10):
         query_total = "SELECT COUNT(*) FROM users WHERE is_admin = FALSE"
@@ -334,7 +711,7 @@ class PGDB:
             print(f"Error fetching paginated users: {e}")
             return {"users": [], "total": 0}
         finally:
-            conn.close()             
+            self.release_connection(conn)             
 
     def insert_call_history(
         self,
@@ -375,7 +752,7 @@ class PGDB:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
 
@@ -443,7 +820,7 @@ class PGDB:
             traceback.print_exc() # Print full traceback
             raise # Re-raise the exception
         finally:
-            conn.close()
+            self.release_connection(conn)
 
     # def get_call_history_by_user_id(self, user_id: int, page: int = 1, page_size: int = 10):
     #     """
@@ -541,7 +918,7 @@ class PGDB:
             logging.error(f"Error fetching call history for user_id={user_id}: {e}")
             raise
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def create_appointment(
@@ -563,7 +940,8 @@ class PGDB:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """
-        with self.get_connection() as conn:
+        conn = self.get_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute(query, (
                     user_id, appointment_date, start_time, end_time,
@@ -572,6 +950,13 @@ class PGDB:
                 appointment_id = cursor.fetchone()[0]
                 conn.commit()
                 return appointment_id
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error creating appointment: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅ FIXED
+            
                 
     def create_appointments_table(self):
         """
@@ -600,7 +985,7 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error creating appointments table: {e}")
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def get_user_appointments(self, user_id: int, from_date: str = None):
@@ -615,10 +1000,16 @@ class PGDB:
             WHERE user_id = %s AND appointment_date >= %s
             ORDER BY appointment_date, start_time
         """
-        with self.get_connection() as conn:
+        conn = self.get_connection()
+        try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(query, (user_id, from_date))
                 return cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Error getting appointments: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅ FIXED
 
     def check_appointment_conflict(
         self,
@@ -640,7 +1031,8 @@ class PGDB:
                 (start_time >= %s AND end_time <= %s)
             )
         """
-        with self.get_connection() as conn:
+        conn = self.get_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute(query, (
                     user_id, appointment_date,
@@ -650,6 +1042,11 @@ class PGDB:
                 ))
                 result = cursor.fetchone()
                 return result[0] > 0
+        except Exception as e:
+            logging.error(f"Error checking conflict: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅ FIXED
 
     def get_available_slots(
         self,
@@ -666,18 +1063,21 @@ class PGDB:
             WHERE user_id = %s AND appointment_date = %s AND status = 'scheduled'
             ORDER BY start_time
         """
-        with self.get_connection() as conn:
+        conn = self.get_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute(query, (user_id, appointment_date))
                 booked_slots = cursor.fetchall()
-        
-        # Logic to calculate available slots (simplified)
-        # You can expand this to generate proper available slots
-        return {
-            "date": appointment_date,
-            "booked_slots": [{"start": slot[0], "end": slot[1]} for slot in booked_slots]
-        }
-
+            
+            return {
+                "date": appointment_date,
+                "booked_slots": [{"start": slot[0], "end": slot[1]} for slot in booked_slots]
+            }
+        except Exception as e:
+            logging.error(f"Error getting available slots: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅ FIXED
 
     def get_call_by_id(self, call_id: str, user_id: int):
         """Get a specific call by ID for a user"""
@@ -689,12 +1089,12 @@ class PGDB:
             FROM call_history
             WHERE call_id = %s AND user_id = %s
         """
-        with self.get_connection() as conn:
+        conn = self.get_connection()
+        try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(query, (call_id, user_id))
                 result = cursor.fetchone()
                 
-                # Parse transcript if it's a string
                 if result and isinstance(result.get("transcript"), str):
                     try:
                         result["transcript"] = json.loads(result["transcript"])
@@ -702,9 +1102,114 @@ class PGDB:
                         pass
                 
                 return result
+        except Exception as e:
+            logging.error(f"Error getting call by ID: {e}")
+            raise
+        finally:
+            self.release_connection(conn)  # ✅ FIXED
 
 
 
+    def add_call_event(self, call_id: str, event_type: str, event_data: dict = None):
+        """Add a unique event entry into call_history.events_log"""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Fetch existing events
+                cursor.execute("SELECT events_log FROM call_history WHERE call_id = %s", (call_id,))
+                row = cursor.fetchone()
+                if not row:
+                    logging.warning(f"Call {call_id} not found for event {event_type}")
+                    return
+                
+                events_log = row[0] or []
+                if isinstance(events_log, str):
+                    try:
+                        events_log = json.loads(events_log)
+                    except Exception:
+                        events_log = []
+
+                # Check for duplicate event
+                if any(ev.get("event") == event_type for ev in events_log):
+                    logging.info(f"Duplicate event {event_type} ignored for {call_id}")
+                    return
+
+                # Append event
+                events_log.append({
+                    "event": event_type,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "data": event_data or {}
+                })
+
+                # Update DB
+                cursor.execute(
+                    "UPDATE call_history SET events_log = %s WHERE call_id = %s",
+                    (json.dumps(events_log), call_id)
+                )
+
+            conn.commit()
+            logging.info(f"Event '{event_type}' added to call {call_id}")
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error adding call event: {e}")
+        finally:
+            self.release_connection(conn)
+
+    def add_agent_event(self, call_id: str, event_type: str, event_data: dict = None, timestamp: str = None):
+        """Add a unique agent event entry into call_history.agent_events"""
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc).isoformat()
+        
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Fetch existing events
+                cursor.execute("SELECT agent_events FROM call_history WHERE call_id = %s", (call_id,))
+                row = cursor.fetchone()
+                if not row:
+                    logging.warning(f"Call {call_id} not found for agent event {event_type}")
+                    return
+                
+                events_log = row[0] or []
+                if isinstance(events_log, str):
+                    try:
+                        events_log = json.loads(events_log)
+                    except Exception:
+                        events_log = []
+
+                # Check for duplicate (within 5s timestamp tolerance)
+                now = datetime.now(timezone.utc)
+                for ev in events_log:
+                    if (ev.get("event_type") == event_type and 
+                        abs((now - datetime.fromisoformat(ev.get("timestamp").replace("Z", "+00:00"))).total_seconds()) < 5):
+                        logging.info(f"Duplicate agent event {event_type} ignored for {call_id}")
+                        return
+
+                # Append event
+                events_log.append({
+                    "event_type": event_type,
+                    "event_data": event_data or {},
+                    "timestamp": timestamp,
+                    "received_at": datetime.now(timezone.utc).isoformat()
+                })
+
+                # Update DB
+                cursor.execute(
+                    "UPDATE call_history SET agent_events = %s WHERE call_id = %s",
+                    (json.dumps(events_log), call_id)
+                )
+
+            conn.commit()
+            logging.info(f"Agent event '{event_type}' added to call {call_id}")
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Error adding agent event: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            self.release_connection(conn)
 
 
 
