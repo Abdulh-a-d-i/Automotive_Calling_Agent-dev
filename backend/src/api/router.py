@@ -106,27 +106,44 @@ def login_user(user: UserLogin):
 
 
 voices = {
-    "david": "ff2c405b-3dba-41e0-9261-bc8ee3f91f46",
-    "ravi": "0d6d0300-6aa7-4620-bf2e-297c7deff756",
-    "emily-british": "9497013c-c348-485b-9ede-9b6e246c9578",
-    "alice-british": "dac8fda9-5c55-45e5-b378-ebd311dbb311",
-    "julia-british": "d70c223b-c039-4f35-9e93-771b2ca481e1",
-    "julio": "db9f650b-1846-4865-aa72-eb5d02bcc402",
-    "donato": "331127cc-600e-4f19-955a-0689cd310eef",
-    "helena-spanish-6": "642bfa76-18da-4574-857d-4e1a7144db39",
-    "rosa": "ecf0f240-3a2a-4d9e-876a-d175108b2e42",
-    "mariam": "6432587a-1454-4b3f-820a-7a2962124b7c",
+    # English voices
+    "david": "1SM7GgM6IMuvQlz2BwM3",
+    "ravi": "A7AUsa1uITCDpK29MG3m",
+    "emily-british": "9YWmufCrZ2agGoSoVL8je",
+    "alice-british": "XcXEQzuLXRU9RcfWzEJt",
+    "julia-british": "ZtcPZrt9K4w8e1OB9M6w",
+    
+    # Spanish voices
+    "julio": "A7AUsa1uITCDpK29MG3m",
+    "donato": "851ejYcv2BoNPjrkw93G",
+    "helena-spanish": "5vkxOzoz40FrElmLP4P7",
+    "rosa": "BIvP0GN1cAtSRTxNHnWS",
+    "mariam": "90ipbRoKi4CpHXvKVtl0",
 }
-
-
-
 
 @router.post("/assistant-initiate-call")
 async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_current_user)):
     try:
         room_name = f"call-{user['id']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
-        # ✅ STEP 1: Get user's custom prompt from DB (single field)
+        # ✅ Get voice_id from payload.voice name
+        voice_name = getattr(payload, "voice", "david").lower()  # Default to 'david'
+        voice_id = voices.get(voice_name)
+        
+        if not voice_id:
+            logging.warning(f"⚠️ Unknown voice '{voice_name}', using default 'david'")
+            voice_id = voices["david"]
+            voice_name = "david"
+        
+        # ✅ Get language from payload (default to 'en')
+        language = getattr(payload, "language", "en").lower()
+        if language not in ["en", "es"]:
+            logging.warning(f"⚠️ Unknown language '{language}', defaulting to 'en'")
+            language = "en"
+        
+        logging.info(f"🎤 Using voice: {voice_name} (ID: {voice_id}), Language: {language}")
+        
+        # ✅ STEP 1: Get user's custom prompt from DB
         user_prompt_data = db.get_user_prompt(user["id"])
         
         if not user_prompt_data:
@@ -139,14 +156,16 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
             base_prompt=base_prompt,
             caller_name=payload.caller_name,
             caller_email=payload.caller_email,
-            call_context=payload.context
+            call_context=payload.context,
+            language=language  
+
         )
         
         complete_system_prompt = prompt_builder.generate_complete_prompt()
         
         logging.info(f"📝 Built system prompt ({len(complete_system_prompt)} chars)")
         
-        # ✅ STEP 3: Prepare metadata with complete prompt
+        # ✅ STEP 3: Prepare metadata with complete prompt + voice + language
         metadata = {
             "phone_number": payload.outbound_number,
             "call_context": payload.context,
@@ -154,7 +173,10 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
             "caller_name": payload.caller_name,
             "caller_email": payload.caller_email,
             "system_prompt": complete_system_prompt,
-            "agent_name": "SUMA"  # You can extract this from base_prompt if needed
+            "agent_name": "SUMA",
+            "voice_id": voice_id,        # ✅ NEW
+            "voice_name": voice_name,    # ✅ NEW
+            "language": language         # ✅ NEW
         }
 
         # ✅ STEP 4: Create DB record
@@ -163,7 +185,7 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
             call_id=room_name,
             status="initiated",
             to_number=payload.outbound_number,
-            voice_name=getattr(payload, "voice", None),
+            voice_name=voice_name,  # ✅ Store voice name
         )
         logging.info(f"✅ Created call record: {room_name}")
 
@@ -189,6 +211,8 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
             "success": True,
             "call_id": room_name,
             "dispatch_id": dispatch.id,
+            "voice": voice_name,
+            "language": language,
             "message": "Call initiated successfully"
         })
         
@@ -206,7 +230,6 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
                 pass
         
         raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
-
 
 
 @router.post("/livekit-webhook")

@@ -22,6 +22,7 @@ class SystemPromptBuilder:
       **Template:** "Hi! This is {agent_name} calling on behalf of {caller_name}. How are you doing today?"
 
       **Rules:**
+      - You must speak in {Language}
       - Use this exact greeting structure
       - Always mention you're calling on behalf of your client
       - Brief pleasantry to establish rapport
@@ -151,7 +152,8 @@ class SystemPromptBuilder:
       1. ALWAYS say a filler phrase BEFORE calling any tool
       2. NEVER call tools silently (creates awkward pauses)
       3. NEVER call multiple tools without speaking between them
-      4. Wait for tool response before continuing conversation
+      4. Wait for tool response before continuing to calll the next tool
+
 
       #### TOOL: check_availability
       **PURPOSE:** Verify if a specific date/time slot is free in client's calendar
@@ -362,47 +364,74 @@ class SystemPromptBuilder:
         base_prompt: str,
         caller_name: str,
         caller_email: str,
-        call_context: str
+        call_context: str,
+        language: str = "en"  # ✅ NEW PARAMETER
     ):
         """
         Initialize the prompt builder with call-specific data.
         
         Args:
-            base_prompt: User's customized system prompt from DB (single text field)
-            caller_name: Client's name (person you're calling on behalf of)
+            base_prompt: User's customized system prompt from DB
+            caller_name: Client's name
             caller_email: Client's email
             call_context: What this specific call is about
+            language: Language code (en, es, etc.) - ✅ NEW
         """
         self.base_prompt = base_prompt
         self.caller_name = caller_name
         self.caller_email = caller_email
         self.call_context = call_context
+        self.language = language  # ✅ NEW
         
-        logger.debug(f"SystemPromptBuilder initialized for {self.caller_name}")
+        # ✅ Map language codes to full names
+        self.language_names = {
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "ru": "Russian",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+        }
+        
+        logger.debug(f"SystemPromptBuilder initialized for {self.caller_name} (language: {self.language})")
 
     def _build_call_context_section(self) -> str:
         """Build the call-specific context that gets appended"""
+        language_full = self.language_names.get(self.language, self.language.upper())
+        
         return f"""
 
----
+            ---
 
-### CURRENT CALL CONTEXT
+            ### CURRENT CALL CONTEXT
 
-**Client Information:**
-- Name: {self.caller_name}
-- Email: {self.caller_email}
+            **Client Information:**
+            - Name: {self.caller_name}
+            - Email: {self.caller_email}
 
-**Call Objective:**
-{self.call_context}
+            **Language Requirements:**
+            - You MUST speak in {language_full} throughout the entire conversation
+            - Use natural {language_full} expressions and greetings
+            - All responses must be in {language_full} only
 
-**Instructions for this call:**
-- Always refer to the client as "{self.caller_name}" when speaking
-- You are calling ON BEHALF of {self.caller_name} (they are the customer)
-- The business you're calling is providing the service TO {self.caller_name}
-- Follow the conversation protocol above
-- Check availability before confirming any times
-- Book the appointment once mutual agreement is reached
-"""
+            **Call Objective:**
+            {self.call_context}
+
+            **Instructions for this call:**
+            - Always refer to the client as "{self.caller_name}" when speaking
+            - You are calling ON BEHALF of {self.caller_name} (they are the customer)
+            - The business you're calling is providing the service TO {self.caller_name}
+            - Follow the conversation protocol above
+            - Check availability before confirming any times
+            - Book the appointment once mutual agreement is reached
+            - CRITICAL: Speak only in {language_full}
+            """
 
     def generate_complete_prompt(self) -> str:
         """
@@ -419,50 +448,35 @@ class SystemPromptBuilder:
                 self._build_call_context_section()
             )
             
-            logger.info(f"✅ Generated system prompt: {len(complete_prompt)} chars")
+            logger.info(f"✅ Generated system prompt: {len(complete_prompt)} chars (language: {self.language})")
             return complete_prompt
             
         except Exception as e:
             logger.error(f"Error generating system prompt: {e}")
-            # Return a basic fallback prompt
             return f"You are SUMA, calling on behalf of {self.caller_name}. {self.call_context}"
 
     @classmethod
     def get_default_base_prompt(cls) -> str:
         """Get the default base prompt (used when user hasn't customized)"""
-        return cls.DEFAULT_BASE_PROMPT
+        return cls.CORE_AGENT_RULES
 
-
-# ==================== HELPER FUNCTION FOR EASY USAGE ====================
 
 def build_system_prompt(
     base_prompt: str,
     caller_name: str,
     caller_email: str,
-    call_context: str
+    call_context: str,
+    language: str = "en"  # ✅ NEW PARAMETER
 ) -> str:
     """
     Quick helper function to build a complete system prompt.
-    
-    Usage:
-        from src.models.System_Prompt import build_system_prompt
-        
-        # Get user's custom prompt from DB
-        user_prompt_data = db.get_user_prompt(user_id)
-        
-        # Build complete prompt with call-specific data
-        prompt = build_system_prompt(
-            base_prompt=user_prompt_data["system_prompt"],
-            caller_name="John Doe",
-            caller_email="john@example.com",
-            call_context="Schedule a dentist appointment for teeth cleaning next week"
-        )
     
     Args:
         base_prompt: User's customized system prompt from DB
         caller_name: Client's name
         caller_email: Client's email
         call_context: What to book/accomplish in this call
+        language: Language code (en, es, etc.) - ✅ NEW
     
     Returns:
         Complete system prompt string
@@ -471,6 +485,6 @@ def build_system_prompt(
         base_prompt=base_prompt,
         caller_name=caller_name,
         caller_email=caller_email,
-        call_context=call_context
+        call_context=call_context,
+        language=language  # ✅ NEW
     )
-    return builder.generate_complete_prompt()
