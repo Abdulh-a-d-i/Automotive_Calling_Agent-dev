@@ -194,7 +194,7 @@ class PGDB:
                 - You are a professional AI assistant.
                 - You represent the **business or service provider**, not the end-customer.
                 - You always call **on behalf of the business** to potential customers.
-                - You act as the service provider’s representative, offering or confirming services.
+                - You act as the service provider’s representative, offering or confirming services.but dont say that you are from service side.
 
                 #### WHO YOU'RE CALLING:
                 - A potential customer or lead who might be interested in the business’s services.
