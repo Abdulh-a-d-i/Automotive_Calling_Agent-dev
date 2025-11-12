@@ -109,11 +109,11 @@ voices = {
     # English voices
     "david": "1SM7GgM6IMuvQlz2BwM3",
     "ravi": "A7AUsa1uITCDpK29MG3m",
-    "emily-british": "9YWmufCrZ2agGoSoVL8je",
-    "alice-british": "XcXEQzuLXRU9RcfWzEJt",
+    "emily-british": "YWmufCrZ2agGoSoVL8je",
+    "alice-british": "bMxLr8fP6hzNRRi9nJxU",
     "julia-british": "ZtcPZrt9K4w8e1OB9M6w",
     
-    # Spanish voices
+    # Spanish voicesYWmufCrZ2agGoSoVL8je
     "julio": "A7AUsa1uITCDpK29MG3m",
     "donato": "851ejYcv2BoNPjrkw93G",
     "helena-spanish": "5vkxOzoz40FrElmLP4P7",
@@ -137,7 +137,8 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
         
         # ✅ Get language from payload (default to 'en')
         language = getattr(payload, "language", "en").lower()
-        if language not in ["en", "es"]:
+        valid_languages = ["en", "es", "german", "italian", "french"]
+        if language not in valid_languages:
             logging.warning(f"⚠️ Unknown language '{language}', defaulting to 'en'")
             language = "en"
         
@@ -634,6 +635,7 @@ async def get_appointments(user_id: int, from_date: str = None):
 async def book_appointment(request: Request):
     """
     API for LiveKit agent to book an appointment
+    ✅ SIMPLIFIED: No conflict checking - just book immediately
     """
     try:
         data = await request.json()
@@ -651,22 +653,8 @@ async def book_appointment(request: Request):
         if not all([user_id, appointment_date, start_time, end_time, organizer_email]):
             return error_response("Missing required fields", status_code=400)
         
-        has_conflict = db.check_appointment_conflict(
-            user_id=user_id,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time
-        )
-        
-        if has_conflict:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "success": False,
-                    "message": "Time slot already booked",
-                    "conflict": True
-                }
-            )
+        # ✅ REMOVED: Conflict checking
+        # Just book directly
         
         appointment_id = db.create_appointment(
             user_id=user_id,
@@ -679,6 +667,7 @@ async def book_appointment(request: Request):
             description=description
         )
         
+        # Send calendar invite email
         email_sent = await mail_obj.send_email_with_calendar_event(
             attendee_email=organizer_email,
             attendee_name=organizer_name,
@@ -691,6 +680,8 @@ async def book_appointment(request: Request):
             organizer_email=organizer_email
         )
         
+        logging.info(f"✅ Appointment booked successfully: {appointment_id}")
+        
         return JSONResponse({
             "success": True,
             "appointment_id": appointment_id,
@@ -699,7 +690,8 @@ async def book_appointment(request: Request):
         })
         
     except Exception as e:
-        logging.error(f"Error booking appointment: {e}")
+        logging.error(f"❌ Error booking appointment: {e}")
+        traceback.print_exc()
         return error_response(f"Failed to book appointment: {str(e)}", status_code=500)
 
 
